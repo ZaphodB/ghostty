@@ -158,11 +158,6 @@ pub const Behavior = lib.Enum(lib.target, &.{
 /// drags by word. A triple-click selects and drags by line.
 pub const default_behaviors: [3]Behavior = .{ .cell, .word, .line };
 
-/// Distance from the top or bottom surface edge, in pixels, where dragging
-/// should request autoscroll. This preserves the historical 1px buffer used
-/// so fullscreen-edge drags can still trigger autoscroll.
-const autoscroll_buffer: f64 = 1;
-
 pub const init: SelectionGesture = .{
     .left_click_pin = null,
     .left_click_count = 0,
@@ -329,6 +324,11 @@ pub const Drag = struct {
         /// The width of one terminal cell in surface pixels.
         cell_width: u32,
 
+        /// The height of one terminal cell in surface pixels. Used to size the
+        /// top/bottom autoscroll trigger zone so the last row of cells is a
+        /// reasonable target instead of a single pixel.
+        cell_height: u32,
+
         /// The left padding before the terminal grid begins, in surface pixels.
         padding_left: u32,
 
@@ -373,12 +373,18 @@ pub fn drag(
     const click_pin = self.validatedLeftClickPin(&t.screens) orelse return null;
     if (!d.pin.eql(click_pin.*)) self.left_click_dragged = true;
 
-    // Determine if we should autoscroll. If our drag position is above
-    // the top, we go up. If its below the bottom we go down. Easy.
+    // Determine if we should autoscroll. The trigger zone is one cell tall
+    // along the top and bottom edges of the surface, so the entire top/bottom
+    // row of cells (plus any window padding outside the grid) is a hit target
+    // for autoscroll. Fall back to 1px if cell_height is somehow 0.
     const max_y: f64 = @floatFromInt(d.geometry.screen_height);
-    self.left_drag_autoscroll = if (d.ypos <= autoscroll_buffer)
+    const buffer: f64 = if (d.geometry.cell_height > 0)
+        @floatFromInt(d.geometry.cell_height)
+    else
+        1;
+    self.left_drag_autoscroll = if (d.ypos <= buffer)
         .up
-    else if (d.ypos > max_y - autoscroll_buffer)
+    else if (d.ypos > max_y - buffer)
         .down
     else
         .none;
@@ -948,6 +954,7 @@ fn testDrag(t: *Terminal, x: u16, y: u32, xpos: f64, ypos: f64) Drag {
         .geometry = .{
             .columns = 5,
             .cell_width = 10,
+            .cell_height = 20,
             .padding_left = 0,
             .screen_height = 100,
         },
@@ -968,6 +975,7 @@ fn testAutoscrollTick(
         .geometry = .{
             .columns = 5,
             .cell_width = 10,
+            .cell_height = 20,
             .padding_left = 0,
             .screen_height = 100,
         },
@@ -1009,6 +1017,7 @@ fn testDragSelection(
     const geometry: Drag.Geometry = .{
         .columns = 10,
         .cell_width = 10,
+        .cell_height = 20,
         .padding_left = 5,
         .screen_height = 110,
     };
@@ -1070,6 +1079,7 @@ fn testDragSelectionIsNull(
     const geometry: Drag.Geometry = .{
         .columns = 10,
         .cell_width = 10,
+        .cell_height = 20,
         .padding_left = 5,
         .screen_height = 110,
     };
@@ -1617,16 +1627,18 @@ test "SelectionGesture drag autoscroll edge boundaries" {
     press_event.xpos = 10;
     _ = try gesture.press(&t, press_event);
 
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 1));
+    // testDrag geometry: cell_height = 20, screen_height = 100, so the
+    // autoscroll trigger zone is ypos <= 20 (up) and ypos > 80 (down).
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 20));
     try testing.expectEqual(.up, gesture.left_drag_autoscroll);
 
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 1.1));
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 20.1));
     try testing.expectEqual(.none, gesture.left_drag_autoscroll);
 
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 99));
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 80));
     try testing.expectEqual(.none, gesture.left_drag_autoscroll);
 
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 99.1));
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 80.1));
     try testing.expectEqual(.down, gesture.left_drag_autoscroll);
 }
 
