@@ -4674,9 +4674,12 @@ pub fn cursorPosCallback(
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
-    // Stop selection scrolling when inside the viewport within a 1px buffer
-    // for fullscreen windows, but only when selection scrolling is active.
-    if (pos.y >= 1 and self.selection_scroll_active) {
+    // Stop selection scrolling when inside the viewport. The buffer is one
+    // cell tall so the top/bottom row of cells (plus padding) is treated as
+    // the trigger zone instead of a 1px sliver. Falls back to 1px if
+    // cell.height is somehow 0.
+    const stop_buffer: u32 = if (self.size.cell.height > 0) self.size.cell.height else 1;
+    if (pos.y >= @as(f32, @floatFromInt(stop_buffer)) and self.selection_scroll_active) {
         self.queueIo(
             .{ .selection_scroll = false },
             .locked,
@@ -4766,15 +4769,21 @@ pub fn cursorPosCallback(
 
         // If our y is negative, we're above the window. In this case, we scroll
         // up. The amount we scroll up is dependent on how negative we are.
-        // We allow for a 1 pixel buffer at the top and bottom to detect
-        // scroll even in full screen windows.
+        // The trigger zone is one cell tall along the top and bottom edges so
+        // the entire top/bottom row of cells (plus any padding outside the
+        // grid) is a hit target for autoscroll. Falls back to 1px if
+        // cell.height is somehow 0.
         // Note: one day, we can change this from distance to time based if we want.
         //log.warn("CURSOR POS: {} {}", .{ pos, self.size.screen });
         const max_y: f32 = @floatFromInt(self.size.screen.height);
+        const trigger_buffer: f32 = if (self.size.cell.height > 0)
+            @floatFromInt(self.size.cell.height)
+        else
+            1;
 
         // If the mouse is outside the viewport and we have the left
         // mouse button pressed then we need to start the scroll timer.
-        if ((pos.y <= 1 or pos.y > max_y - 1) and
+        if ((pos.y <= trigger_buffer or pos.y > max_y - trigger_buffer) and
             !self.selection_scroll_active)
         {
             self.queueIo(
