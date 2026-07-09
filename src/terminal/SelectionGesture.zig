@@ -120,6 +120,11 @@ left_click_dragged: bool,
 /// The current autoscroll state for the active left-click drag gesture.
 left_drag_autoscroll: Autoscroll,
 
+/// The number of consecutive autoscroll ticks recorded for the active drag
+/// gesture. Used to accelerate the scroll speed the longer autoscroll stays
+/// active. Reset whenever `left_drag_autoscroll` becomes `.none`.
+left_drag_autoscroll_ticks: usize,
+
 /// The direction that selection dragging should autoscroll the viewport.
 /// This is derived from the most recent drag position relative to the
 /// surface bounds and reset whenever there is no active drag gesture.
@@ -169,6 +174,7 @@ pub const init: SelectionGesture = .{
     .left_click_ypos = 0,
     .left_click_dragged = false,
     .left_drag_autoscroll = .none,
+    .left_drag_autoscroll_ticks = 0,
 };
 
 pub fn deinit(self: *SelectionGesture, t: *Terminal) void {
@@ -198,6 +204,7 @@ pub fn reset(self: *SelectionGesture, t: *Terminal) void {
     self.left_click_behavior = .cell;
     self.left_click_dragged = false;
     self.left_drag_autoscroll = .none;
+    self.left_drag_autoscroll_ticks = 0;
     self.untrackPin(t);
 }
 
@@ -374,20 +381,19 @@ pub fn drag(
     if (!d.pin.eql(click_pin.*)) self.left_click_dragged = true;
 
     // Determine if we should autoscroll. The trigger zone is one cell tall
-    // along the top and bottom edges of the surface, so the entire top/bottom
-    // row of cells (plus any window padding outside the grid) is a hit target
-    // for autoscroll. Fall back to 1px if cell_height is somehow 0.
+    // (plus a few extra pixels) along the top and bottom edges of the
+    // surface, so the entire top/bottom row of cells (plus any window
+    // padding outside the grid) is a hit target for autoscroll. Falls back
+    // to 1px if cell_height is somehow 0.
     const max_y: f64 = @floatFromInt(d.geometry.screen_height);
-    const buffer: f64 = if (d.geometry.cell_height > 0)
-        @floatFromInt(d.geometry.cell_height)
-    else
-        1;
+    const buffer: f64 = autoscrollBuffer(d.geometry.cell_height);
     self.left_drag_autoscroll = if (d.ypos <= buffer)
         .up
     else if (d.ypos > max_y - buffer)
         .down
     else
         .none;
+    if (self.left_drag_autoscroll == .none) self.left_drag_autoscroll_ticks = 0;
 
     const selection = switch (self.left_click_behavior) {
         .cell => dragSelection(
@@ -457,9 +463,12 @@ pub const AutoscrollTick = struct {
 /// is resolved to a pin after scrolling so the drag applies to the row now under
 /// the pointer.
 ///
-/// This always scrolls the viewport by exactly one row in the current
-/// autoscroll direction. If you want to scroll by more, increase your
-/// tick rate.
+/// The number of rows scrolled per tick accelerates: it grows both with how
+/// far past the surface edge the pointer is and with how long the autoscroll
+/// has been continuously active (iTerm2-style), starting at one row per tick
+/// just inside the trigger zone. See `autoscrollMagnitude`. The tick rate is
+/// still up to the caller; the ramp constants assume a tick interval in the
+/// low tens of milliseconds.
 ///
 /// If the original press pin no longer belongs to the active screen, this calls
 /// `reset` and returns null. That is a signal for the caller to stop its
@@ -475,7 +484,7 @@ pub fn autoscrollTick(
         return null;
     }
 
-    const delta: isize = switch (self.left_drag_autoscroll) {
+    const direction: isize = switch (self.left_drag_autoscroll) {
         .none => return null,
         .up => -1,
         .down => 1,
@@ -489,7 +498,13 @@ pub fn autoscrollTick(
         return null;
     };
 
-    t.scrollViewport(.{ .delta = delta });
+    self.left_drag_autoscroll_ticks +|= 1;
+    const magnitude = autoscrollMagnitude(
+        self.left_drag_autoscroll_ticks,
+        tick.ypos,
+        tick.geometry,
+    );
+    t.scrollViewport(.{ .delta = direction * magnitude });
 
     const pin = t.screens.active.pages.pin(.{ .viewport = tick.viewport }) orelse return null;
     return self.drag(t, .{
@@ -500,6 +515,43 @@ pub fn autoscrollTick(
         .word_boundary_codepoints = tick.word_boundary_codepoints,
         .geometry = tick.geometry,
     });
+}
+
+/// Size in pixels of the autoscroll trigger zone along the top and bottom
+/// surface edges: one cell plus a few extra pixels. The drag direction check
+/// and any caller-side stop check must use the same buffer so they don't
+/// fight each other. Falls back to 1px if cell_height is 0 so the C-API
+/// contract stays well-defined.
+fn autoscrollBuffer(cell_height: u32) f64 {
+    const extra_px: f64 = 4;
+    if (cell_height == 0) return 1;
+    return @as(f64, @floatFromInt(cell_height)) + extra_px;
+}
+
+/// The number of rows a single autoscroll tick should scroll. The speed
+/// ramps with (1) how far past the surface edge the pointer is, in cells,
+/// and (2) how many consecutive ticks the autoscroll has been active, so
+/// dragging a large selection accelerates (iTerm2-style) while short
+/// selections stay precise: the first tick just inside the trigger zone
+/// scrolls a single row.
+fn autoscrollMagnitude(ticks: usize, ypos: f64, geometry: Drag.Geometry) isize {
+    const cell_h: f64 = @floatFromInt(@max(geometry.cell_height, 1));
+    const max_y: f64 = @floatFromInt(geometry.screen_height);
+
+    // How far past the surface edge the pointer is, in cells. Zero while
+    // the pointer is inside the surface (i.e. within the trigger zone).
+    const overshoot_cells: f64 = @max(
+        0,
+        if (ypos < 0) -ypos / cell_h else (ypos - max_y) / cell_h,
+    );
+
+    // Time ramp: 1x on the first tick up to 9x after 200 ticks (~3s at a
+    // 15ms tick interval).
+    const time_mult: f64 = 1.0 +
+        @as(f64, @floatFromInt(@min(ticks, 200))) / 25.0;
+
+    const rows: f64 = @min(40, (1.0 + overshoot_cells * 2.0) * time_mult);
+    return @max(1, @as(isize, @intFromFloat(rows)));
 }
 
 /// A pressure-based activation during an existing left-click gesture.
@@ -543,6 +595,7 @@ pub fn deepPress(
     self.left_click_behavior = .cell;
     self.left_click_dragged = true;
     self.left_drag_autoscroll = .none;
+    self.left_drag_autoscroll_ticks = 0;
     self.untrackPin(t);
 
     return sel;
@@ -590,6 +643,7 @@ pub fn release(
         self.left_click_dragged = true;
     }
     self.left_drag_autoscroll = .none;
+    self.left_drag_autoscroll_ticks = 0;
 }
 
 fn pressInitial(
@@ -619,6 +673,7 @@ fn pressInitial(
     self.left_click_time = p.time;
     self.left_click_dragged = false;
     self.left_drag_autoscroll = .none;
+    self.left_drag_autoscroll_ticks = 0;
 }
 
 fn pressRepeat(
@@ -663,6 +718,7 @@ fn pressRepeat(
     self.left_click_time = time;
     self.left_click_dragged = false;
     self.left_drag_autoscroll = .none;
+    self.left_drag_autoscroll_ticks = 0;
     self.left_click_count = @min(
         self.left_click_count + 1,
         3, // We only support triple clicks max
@@ -1628,18 +1684,73 @@ test "SelectionGesture drag autoscroll edge boundaries" {
     _ = try gesture.press(&t, press_event);
 
     // testDrag geometry: cell_height = 20, screen_height = 100, so the
-    // autoscroll trigger zone is ypos <= 20 (up) and ypos > 80 (down).
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 20));
+    // autoscroll trigger zone is one cell + 4px: ypos <= 24 (up) and
+    // ypos > 76 (down).
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 24));
     try testing.expectEqual(.up, gesture.left_drag_autoscroll);
 
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 20.1));
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 24.1));
     try testing.expectEqual(.none, gesture.left_drag_autoscroll);
 
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 80));
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 76));
     try testing.expectEqual(.none, gesture.left_drag_autoscroll);
 
-    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 80.1));
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 76.1));
     try testing.expectEqual(.down, gesture.left_drag_autoscroll);
+}
+
+test "SelectionGesture autoscroll magnitude accelerates" {
+    const geo: Drag.Geometry = .{
+        .columns = 5,
+        .cell_width = 10,
+        .cell_height = 20,
+        .padding_left = 0,
+        .screen_height = 100,
+    };
+
+    // The first tick just inside the trigger zone scrolls a single row.
+    try testing.expectEqual(@as(isize, 1), autoscrollMagnitude(1, 90, geo));
+
+    // Sustained autoscroll accelerates over time.
+    try testing.expect(autoscrollMagnitude(100, 90, geo) >
+        autoscrollMagnitude(1, 90, geo));
+
+    // Pointer distance past the edge raises the speed immediately,
+    // for both the bottom and top edges.
+    try testing.expect(autoscrollMagnitude(1, 160, geo) >
+        autoscrollMagnitude(1, 90, geo));
+    try testing.expect(autoscrollMagnitude(1, -60, geo) >
+        autoscrollMagnitude(1, 10, geo));
+
+    // The speed is capped.
+    try testing.expectEqual(@as(isize, 40), autoscrollMagnitude(10_000, 10_000, geo));
+}
+
+test "SelectionGesture autoscroll tick counter resets when leaving the zone" {
+    var t = try Terminal.init(testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback = 10 });
+    defer t.deinit(testing.allocator);
+    try t.printString("1111\n2222\n3333\n4444\n5555");
+    t.scrollViewport(.{ .delta = -2 });
+
+    var gesture: SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    var press_event = testPress(&t, 1, 1, try std.time.Instant.now());
+    press_event.xpos = 10;
+    _ = try gesture.press(&t, press_event);
+
+    _ = gesture.drag(&t, testDrag(&t, 3, 2, 39, 100));
+    try testing.expectEqual(.down, gesture.left_drag_autoscroll);
+
+    _ = gesture.autoscrollTick(&t, testAutoscrollTick(.{ .x = 3, .y = 2 }, 39, 100));
+    _ = gesture.autoscrollTick(&t, testAutoscrollTick(.{ .x = 3, .y = 2 }, 39, 100));
+    try testing.expectEqual(@as(usize, 2), gesture.left_drag_autoscroll_ticks);
+
+    // Dragging back inside the surface stops autoscroll and resets the
+    // acceleration ramp.
+    _ = gesture.drag(&t, testDrag(&t, 3, 1, 39, 50));
+    try testing.expectEqual(.none, gesture.left_drag_autoscroll);
+    try testing.expectEqual(@as(usize, 0), gesture.left_drag_autoscroll_ticks);
 }
 
 test "SelectionGesture autoscroll tick scrolls and continues drag" {
