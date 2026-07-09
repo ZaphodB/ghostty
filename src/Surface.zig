@@ -149,6 +149,10 @@ focused: bool = true,
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
 
+/// Number of consecutive selection scroll ticks. Used to accelerate
+/// the scroll speed the longer the scroll stays active (iTerm2-style).
+selection_scroll_ticks: usize = 0,
+
 /// True if the surface is in read-only mode. When read-only, no input
 /// is sent to the PTY but terminal-level operations like selections,
 /// (native) scrolling, and copy keybinds still work. Warn before quit is
@@ -1107,6 +1111,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
+            if (!active) self.selection_scroll_ticks = 0;
             try self.selectionScrollTick();
         },
 
@@ -1162,7 +1167,24 @@ fn selectionScrollTick(self: *Surface) !void {
 
     const pos = try self.rt_surface.getCursorPos();
     const pos_vp = self.posToViewport(pos.x, pos.y);
-    const delta: isize = if (pos.y < 0) -1 else 1;
+
+    // The scroll speed ramps with (1) how far past the viewport edge the
+    // pointer is, in cells, and (2) how long the scroll has been active,
+    // so dragging a large selection accelerates like iTerm2. Just inside
+    // the trigger zone starts at one row per tick and ramps up; pushing
+    // the pointer further past the edge raises the base speed.
+    self.selection_scroll_ticks +|= 1;
+    const cell_h: f32 = @floatFromInt(@max(self.size.cell.height, 1));
+    const max_y: f32 = @floatFromInt(self.size.screen.height);
+    const overshoot_cells: f32 = @max(
+        0,
+        if (pos.y < 0) -pos.y / cell_h else (pos.y - max_y) / cell_h,
+    );
+    const time_mult: f32 = 1.0 +
+        @as(f32, @floatFromInt(@min(self.selection_scroll_ticks, 200))) / 25.0;
+    const rows: f32 = @min(40, (1.0 + overshoot_cells * 2.0) * time_mult);
+    const magnitude: isize = @max(1, @as(isize, @intFromFloat(rows)));
+    const delta: isize = if (pos.y < 0) -magnitude else magnitude;
 
     // We need our locked state for the remainder
     self.renderer_state.mutex.lock();
@@ -1197,6 +1219,16 @@ fn selectionScrollTick(self: *Surface) !void {
     // We modified our viewport and selection so we need to queue
     // a render.
     try self.queueRender();
+}
+
+/// Size in pixels of the selection autoscroll trigger zone along the top
+/// and bottom viewport edges: one cell plus a few extra pixels. The stop
+/// check in cursorPosCallback must use the same buffer so it doesn't
+/// fight the trigger.
+fn selectionScrollBuffer(cell_height: u32) f32 {
+    const extra_px: f32 = 4;
+    if (cell_height == 0) return 1;
+    return @as(f32, @floatFromInt(cell_height)) + extra_px;
 }
 
 fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
@@ -4674,12 +4706,19 @@ pub fn cursorPosCallback(
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
-    // Stop selection scrolling when inside the viewport. The buffer is one
-    // cell tall so the top/bottom row of cells (plus padding) is treated as
-    // the trigger zone instead of a 1px sliver. Falls back to 1px if
-    // cell.height is somehow 0.
-    const stop_buffer: u32 = if (self.size.cell.height > 0) self.size.cell.height else 1;
-    if (pos.y >= @as(f32, @floatFromInt(stop_buffer)) and self.selection_scroll_active) {
+    // Stop selection scrolling when inside the viewport, i.e. between the
+    // top and bottom trigger zones. The buffer is one cell tall plus a few
+    // extra pixels so the top/bottom row of cells (plus padding) is treated
+    // as the trigger zone instead of a 1px sliver. Falls back to 1px if
+    // cell.height is somehow 0. The bottom bound matters: without it any
+    // mouse motion during bottom-edge scrolling stops/restarts the timer,
+    // which resets the acceleration ramp.
+    const stop_buffer: f32 = selectionScrollBuffer(self.size.cell.height);
+    const stop_max_y: f32 = @floatFromInt(self.size.screen.height);
+    if (pos.y >= stop_buffer and
+        pos.y <= stop_max_y - stop_buffer and
+        self.selection_scroll_active)
+    {
         self.queueIo(
             .{ .selection_scroll = false },
             .locked,
@@ -4769,17 +4808,13 @@ pub fn cursorPosCallback(
 
         // If our y is negative, we're above the window. In this case, we scroll
         // up. The amount we scroll up is dependent on how negative we are.
-        // The trigger zone is one cell tall along the top and bottom edges so
-        // the entire top/bottom row of cells (plus any padding outside the
-        // grid) is a hit target for autoscroll. Falls back to 1px if
-        // cell.height is somehow 0.
-        // Note: one day, we can change this from distance to time based if we want.
+        // The trigger zone is one cell tall (plus a few extra pixels) along
+        // the top and bottom edges so the entire top/bottom row of cells
+        // (plus any padding outside the grid) is a hit target for autoscroll.
+        // Falls back to 1px if cell.height is somehow 0.
         //log.warn("CURSOR POS: {} {}", .{ pos, self.size.screen });
         const max_y: f32 = @floatFromInt(self.size.screen.height);
-        const trigger_buffer: f32 = if (self.size.cell.height > 0)
-            @floatFromInt(self.size.cell.height)
-        else
-            1;
+        const trigger_buffer: f32 = selectionScrollBuffer(self.size.cell.height);
 
         // If the mouse is outside the viewport and we have the left
         // mouse button pressed then we need to start the scroll timer.
