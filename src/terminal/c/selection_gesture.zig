@@ -201,6 +201,7 @@ pub const EventOption = enum(c_int) {
 pub const Geometry = extern struct {
     columns: u32,
     cell_width: u32,
+    cell_height: u32,
     padding_left: u32,
     screen_height: u32,
 
@@ -211,6 +212,7 @@ pub const Geometry = extern struct {
         return .{
             .columns = self.columns,
             .cell_width = self.cell_width,
+            .cell_height = self.cell_height,
             .padding_left = self.padding_left,
             .screen_height = self.screen_height,
         };
@@ -1212,6 +1214,7 @@ test "selection gesture event applies drag" {
     const geometry: Geometry = .{
         .columns = 5,
         .cell_width = 10,
+        .cell_height = 10,
         .padding_left = 0,
         .screen_height = 20,
     };
@@ -1266,6 +1269,7 @@ test "selection gesture drag requires ref and geometry" {
     const invalid_geometry: Geometry = .{
         .columns = 5,
         .cell_width = 0,
+        .cell_height = 10,
         .padding_left = 0,
         .screen_height = 20,
     };
@@ -1318,6 +1322,7 @@ test "selection gesture event applies autoscroll tick" {
     const geometry: Geometry = .{
         .columns = 5,
         .cell_width = 10,
+        .cell_height = 10,
         .padding_left = 0,
         .screen_height = 20,
     };

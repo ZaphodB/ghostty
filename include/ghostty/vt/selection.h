@@ -363,6 +363,14 @@ typedef struct {
   /** Width of one terminal cell in surface pixels. Must be non-zero. */
   uint32_t cell_width;
 
+  /**
+   * Height of one terminal cell in surface pixels. Sizes the autoscroll
+   * trigger zone along the top/bottom edge of the surface (one cell plus
+   * a few extra pixels) and the autoscroll speed ramp. Falls back to a
+   * 1px zone if zero.
+   */
+  uint32_t cell_height;
+
   /** Left padding before the terminal grid begins in surface pixels. */
   uint32_t padding_left;
 

@@ -1218,6 +1218,7 @@ fn selectionScrollTick(self: *Surface) !void {
         .geometry = .{
             .columns = @intCast(self.size.grid().columns),
             .cell_width = self.size.cell.width,
+            .cell_height = self.size.cell.height,
             .padding_left = self.size.padding.left,
             .screen_height = self.size.screen.height,
         },
@@ -4712,6 +4713,7 @@ pub fn cursorPosCallback(
             .geometry = .{
                 .columns = @intCast(self.size.grid().columns),
                 .cell_width = self.size.cell.width,
+                .cell_height = self.size.cell.height,
                 .padding_left = self.size.padding.left,
                 .screen_height = self.size.screen.height,
             },
