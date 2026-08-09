@@ -292,9 +292,23 @@ extension Ghostty {
             // A drag can emit multiple selection changes. Debounce so screen
             // readers hear one announcement once the selection settles.
             accessibilitySelectionCancellable = NotificationCenter.default
-                .publisher(for: .ghosttySelectionDidChange, object: self)
+                // The publisher retains its object, so filtering with a weak capture
+                // avoids a cycle between self and the stored cancellable.
+                // But we also need to be careful to do the map below (see
+                // comment below)
+                .publisher(for: .ghosttySelectionDidChange)
+                .filter { [weak self] notification in
+                    guard let self else { return false }
+                    return notification.object as AnyObject? === self
+                }
+                .map { _ in
+                    // Debounce retains its latest upstream value. In this
+                    // case its a Notification, which retains its object,
+                    // which is a surface. So this creates a retain cycle.
+                    // This discards the notification before debounce.
+                }
                 .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
-                .sink { [weak self] _ in
+                .sink { [weak self] in
                     guard let self else { return }
                     NSAccessibility.post(element: self, notification: .selectedTextChanged)
                 }
@@ -2036,6 +2050,8 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             return
         }
 
+        let hadMarkedText = hasMarkedText()
+
         // If insertText is called, our preedit must be over.
         unmarkText()
 
@@ -2044,6 +2060,13 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         if var acc = keyTextAccumulator {
             acc.append(chars)
             keyTextAccumulator = acc
+            return
+        }
+
+        if hadMarkedText, !chars.isEmpty {
+            // Send preedit commits as key events instead of raw text for
+            // keybind interpretation by programs.
+            _ = committedPreeditTextAction(GHOSTTY_ACTION_PRESS, text: chars)
             return
         }
 
@@ -2214,7 +2237,6 @@ extension Ghostty.SurfaceView {
     static let dropTypes: Set<NSPasteboard.PasteboardType> = [
         .string,
         .fileURL,
-        .URL
     ]
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
@@ -2234,24 +2256,7 @@ extension Ghostty.SurfaceView {
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         let pb = sender.draggingPasteboard
 
-        let content: String?
-        if let url = pb.string(forType: .URL) {
-            // URLs first, they get escaped as-is.
-            content = Ghostty.Shell.escape(url)
-        } else if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL],
-           urls.count > 0 {
-            // File URLs next. They get escaped individually and then joined by a
-            // space if there are multiple.
-            content = urls
-                .map { Ghostty.Shell.escape($0.path) }
-                .joined(separator: " ")
-        } else if let str = pb.string(forType: .string) {
-            // Strings are not escaped because they may be copy/pasting a
-            // command they want to execute.
-            content = str
-        } else {
-            content = nil
-        }
+        let content = pb.getOpinionatedStringContents()
 
         if let content {
             DispatchQueue.main.async {
@@ -2373,6 +2378,7 @@ extension Ghostty.SurfaceView {
 /// We use this to cache our surface content. This probably should be extracted some day
 /// to a more generic helper.
 class CachedValue<T> {
+    private let lock = NSLock()
     private var value: T?
     private let fetch: () -> T
     private let duration: Duration
@@ -2384,10 +2390,15 @@ class CachedValue<T> {
     }
 
     deinit {
+        lock.lock()
         expiryTask?.cancel()
+        lock.unlock()
     }
 
     func get() -> T {
+        lock.lock()
+        defer { lock.unlock() }
+
         if let value {
             return value
         }
@@ -2402,13 +2413,20 @@ class CachedValue<T> {
         expiryTask = Task { [weak self] in
             do {
                 try await Task.sleep(until: expires)
-                self?.value = nil
-                self?.expiryTask = nil
+                self?.expire()
             } catch {
                 // Task was cancelled, do nothing
             }
         }
 
         return result
+    }
+
+    private func expire() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        value = nil
+        expiryTask = nil
     }
 }
